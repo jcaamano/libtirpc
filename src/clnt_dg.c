@@ -36,11 +36,13 @@
 #include <reentrant.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/queue.h>
 #include <stdint.h>
 #include <poll.h>
 
 #include <sys/time.h>
 
+#include <assert.h>
 #include <sys/ioctl.h>
 #include <rpc/clnt.h>
 #include <arpa/inet.h>
@@ -87,8 +89,11 @@ static void clnt_dg_destroy(CLIENT *);
  *	code is proven to work, this should be the first thing fixed.  One step
  *	at a time.
  */
-static int	*dg_fd_locks;
 extern mutex_t clnt_fd_lock;
+
+#ifndef FD_LOCK_LIST
+
+static int	*dg_fd_locks;
 static cond_t	*dg_cv;
 #define	release_fd_lock(fd, mask) {		\
 	mutex_lock(&clnt_fd_lock);	\
@@ -97,6 +102,32 @@ static cond_t	*dg_cv;
 	thr_sigsetmask(SIG_SETMASK, &(mask), NULL); \
 	cond_signal(&dg_cv[fd]);	\
 }
+
+#else
+
+struct fd_lock {
+	int fd;
+	u_int clnts;
+	bool_t active;
+	cond_t cv;
+	TAILQ_ENTRY(fd_lock) link;
+};
+typedef TAILQ_HEAD(, fd_lock) fd_lock_list_t;
+static fd_lock_list_t fd_lock_list = TAILQ_HEAD_INITIALIZER(fd_lock_list);
+#define release_fd_lock(fdl, mask) {					\
+	mutex_lock(&clnt_fd_lock);					\
+	fdl->active = FALSE;						\
+	mutex_unlock(&clnt_fd_lock);					\
+	thr_sigsetmask(SIG_SETMASK, &(mask), NULL);			\
+	cond_signal(&fdl->cv);						\
+}
+#define find_fd_lock(fdl, _fd)						\
+	for (fdl = TAILQ_FIRST(&fd_lock_list);				\
+	     fdl != NULL && fdl->fd != _fd;				\
+	     fdl = TAILQ_NEXT(fdl, link));
+
+#endif
+
 
 static const char mem_err_clnt_dg[] = "clnt_dg_create: out of memory";
 
@@ -159,6 +190,8 @@ clnt_dg_create(fd, svcaddr, program, version, sendsz, recvsz)
 	sigfillset(&newmask);
 	thr_sigsetmask(SIG_SETMASK, &newmask, &mask);
 	mutex_lock(&clnt_fd_lock);
+
+#ifndef FD_LOCK_LIST
 	if (dg_fd_locks == (int *) NULL) {
 		size_t cv_allocsz, fd_allocsz;
 		unsigned int dtbsize = __rpc_dtbsize();
@@ -196,6 +229,26 @@ clnt_dg_create(fd, svcaddr, program, version, sendsz, recvsz)
 				cond_init(&dg_cv[i], 0, (void *) 0);
 		}
 	}
+#else
+	struct fd_lock *fdl;
+	find_fd_lock(fdl, fd);
+	if (fdl == NULL) {
+		fdl = (struct fd_lock *)malloc(sizeof *fdl);
+		if (fdl == NULL) {
+			mutex_unlock(&clnt_fd_lock);
+			thr_sigsetmask(SIG_SETMASK, &(mask), NULL);
+			errno = ENOMEM;
+			goto err1;
+		}
+		fdl->fd = fd;
+		fdl->clnts = 1;
+		fdl->active = FALSE;
+		cond_init(&fdl->cv, 0, (void *) 0);
+		TAILQ_INSERT_HEAD(&fd_lock_list, fdl, link);
+	} else {
+		fdl->clnts++;
+	}
+#endif
 
 	mutex_unlock(&clnt_fd_lock);
 	thr_sigsetmask(SIG_SETMASK, &(mask), NULL);
@@ -291,6 +344,16 @@ err2:
 		if (cu)
 			mem_free(cu, sizeof (*cu) + sendsz + recvsz);
 	}
+#ifdef FD_LOCK_LIST
+	if (fdl) {
+		fdl->clnts--;
+		if (fdl->clnts <= 0) {
+			TAILQ_REMOVE(&fd_lock_list, fdl, link);
+			cond_destroy(&fdl->cv);
+			mem_free(fdl, sizeof (*fdl));
+		}
+	}
+#endif
 	return (NULL);
 }
 
@@ -319,17 +382,27 @@ clnt_dg_call(cl, proc, xargs, argsp, xresults, resultsp, utimeout)
 	sigset_t newmask;
 	socklen_t salen;
 	ssize_t recvlen = 0;
-	int rpc_lock_value;
 	u_int32_t xid, inval, outval;
 
 	outlen = 0;
 	sigfillset(&newmask);
 	thr_sigsetmask(SIG_SETMASK, &newmask, &mask);
 	mutex_lock(&clnt_fd_lock);
+
+#ifndef FD_LOCK_LIST
 	while (dg_fd_locks[cu->cu_fd])
 		cond_wait(&dg_cv[cu->cu_fd], &clnt_fd_lock);
-	rpc_lock_value = 1;
+	int rpc_lock_value = 1;
 	dg_fd_locks[cu->cu_fd] = rpc_lock_value;
+#else
+	struct fd_lock *fdl;
+	find_fd_lock(fdl, cu->cu_fd);
+	assert(fdl != NULL);
+	while (fdl->active)
+		cond_wait(&fdl->cv, &clnt_fd_lock);
+	fdl->active = TRUE;
+#endif
+
 	mutex_unlock(&clnt_fd_lock);
 	if (cu->cu_total.tv_usec == -1) {
 		timeout = utimeout;	/* use supplied timeout */
@@ -473,7 +546,11 @@ get_reply:
 		  mem_free(cbuf, (outlen + 256));
 		  e = (struct sock_extended_err *) CMSG_DATA(cmsg);
 		  cu->cu_error.re_errno = e->ee_errno;
+#ifndef FD_LOCK_LIST
 		  release_fd_lock(cu->cu_fd, mask);
+#else
+		  release_fd_lock(fdl, mask);
+#endif
 		  return (cu->cu_error.re_status = RPC_CANTRECV);
 		}
 	  mem_free(cbuf, (outlen + 256));
@@ -553,7 +630,11 @@ get_reply:
 
 	}
 out:
+#ifndef FD_LOCK_LIST
 	release_fd_lock(cu->cu_fd, mask);
+#else
+	release_fd_lock(fdl, mask);
+#endif
 	return (cu->cu_error.re_status);
 }
 
@@ -582,13 +663,27 @@ clnt_dg_freeres(cl, xdr_res, res_ptr)
 	sigfillset(&newmask);
 	thr_sigsetmask(SIG_SETMASK, &newmask, &mask);
 	mutex_lock(&clnt_fd_lock);
+
+#ifndef FD_LOCK_LIST
 	while (dg_fd_locks[cu->cu_fd])
 		cond_wait(&dg_cv[cu->cu_fd], &clnt_fd_lock);
+#else
+	struct fd_lock *fdl;
+	find_fd_lock(fdl, cu->cu_fd);
+	assert(fdl != NULL);
+	while (fdl->active)
+		cond_wait(&fdl->cv, &clnt_fd_lock);
+#endif
+
 	xdrs->x_op = XDR_FREE;
 	dummy = (*xdr_res)(xdrs, res_ptr);
 	mutex_unlock(&clnt_fd_lock);
 	thr_sigsetmask(SIG_SETMASK, &mask, NULL);
+#ifndef FD_LOCK_LIST
 	cond_signal(&dg_cv[cu->cu_fd]);
+#else
+	cond_signal(&fdl->cv);
+#endif
 	return (dummy);
 }
 
@@ -609,36 +704,62 @@ clnt_dg_control(cl, request, info)
 	struct netbuf *addr;
 	sigset_t mask;
 	sigset_t newmask;
-	int rpc_lock_value;
 
 	sigfillset(&newmask);
 	thr_sigsetmask(SIG_SETMASK, &newmask, &mask);
 	mutex_lock(&clnt_fd_lock);
+
+#ifndef FD_LOCK_LIST
 	while (dg_fd_locks[cu->cu_fd])
 		cond_wait(&dg_cv[cu->cu_fd], &clnt_fd_lock);
-        rpc_lock_value = 1;
+        int rpc_lock_value = 1;
 	dg_fd_locks[cu->cu_fd] = rpc_lock_value;
+#else
+	struct fd_lock *fdl;
+	find_fd_lock(fdl, cu->cu_fd);
+	assert(fdl != NULL);
+	while (fdl->active)
+		cond_wait(&fdl->cv, &clnt_fd_lock);
+	fdl->active = TRUE;
+#endif
+
 	mutex_unlock(&clnt_fd_lock);
 	switch (request) {
 	case CLSET_FD_CLOSE:
 		cu->cu_closeit = TRUE;
+#ifndef FD_LOCK_LIST
 		release_fd_lock(cu->cu_fd, mask);
+#else
+		release_fd_lock(fdl, mask);
+#endif
 		return (TRUE);
 	case CLSET_FD_NCLOSE:
 		cu->cu_closeit = FALSE;
+#ifndef FD_LOCK_LIST
 		release_fd_lock(cu->cu_fd, mask);
+#else
+		release_fd_lock(fdl, mask);
+#endif
 		return (TRUE);
 	}
 
 	/* for other requests which use info */
 	if (info == NULL) {
+#ifndef FD_LOCK_LIST
 		release_fd_lock(cu->cu_fd, mask);
+#else
+		release_fd_lock(fdl, mask);
+#endif
 		return (FALSE);
 	}
 	switch (request) {
 	case CLSET_TIMEOUT:
 		if (time_not_ok((struct timeval *)info)) {
+#ifndef FD_LOCK_LIST
 			release_fd_lock(cu->cu_fd, mask);
+#else
+			release_fd_lock(fdl, mask);
+#endif
 			return (FALSE);
 		}
 		cu->cu_total = *(struct timeval *)info;
@@ -652,7 +773,11 @@ clnt_dg_control(cl, request, info)
 		break;
 	case CLSET_RETRY_TIMEOUT:
 		if (time_not_ok((struct timeval *)info)) {
+#ifndef FD_LOCK_LIST
 			release_fd_lock(cu->cu_fd, mask);
+#else
+			release_fd_lock(fdl, mask);
+#endif
 			return (FALSE);
 		}
 		cu->cu_wait = *(struct timeval *)info;
@@ -672,7 +797,11 @@ clnt_dg_control(cl, request, info)
 	case CLSET_SVC_ADDR:		/* set to new address */
 		addr = (struct netbuf *)info;
 		if (addr->len < sizeof cu->cu_raddr) {
+#ifndef FD_LOCK_LIST
 			release_fd_lock(cu->cu_fd, mask);
+#else
+			release_fd_lock(fdl, mask);
+#endif
 			return (FALSE);
 		}
 		(void) memcpy(&cu->cu_raddr, addr->buf, addr->len);
@@ -735,10 +864,19 @@ clnt_dg_control(cl, request, info)
 		cu->cu_connect = *(int *)info;
 		break;
 	default:
+#ifndef FD_LOCK_LIST
 		release_fd_lock(cu->cu_fd, mask);
+#else
+		release_fd_lock(fdl, mask);
+#endif
 		return (FALSE);
 	}
+
+#ifndef FD_LOCK_LIST
 	release_fd_lock(cu->cu_fd, mask);
+#else
+	release_fd_lock(fdl, mask);
+#endif
 	return (TRUE);
 }
 
@@ -754,8 +892,24 @@ clnt_dg_destroy(cl)
 	sigfillset(&newmask);
 	thr_sigsetmask(SIG_SETMASK, &newmask, &mask);
 	mutex_lock(&clnt_fd_lock);
+
+#ifndef FD_LOCK_LIST
 	while (dg_fd_locks[cu_fd])
 		cond_wait(&dg_cv[cu_fd], &clnt_fd_lock);
+#else
+	struct fd_lock *fdl;
+	find_fd_lock(fdl, cu->cu_fd);
+	assert(fdl != NULL);
+	while (fdl->active)
+		cond_wait(&fdl->cv, &clnt_fd_lock);
+	fdl->clnts--;
+	if (fdl->clnts <= 0) {
+		TAILQ_REMOVE(&fd_lock_list, fdl, link);
+		cond_destroy(&fdl->cv);
+		mem_free(fdl, sizeof (*fdl));
+	}
+#endif
+
 	if (cu->cu_closeit)
 		(void)close(cu_fd);
 	XDR_DESTROY(&(cu->cu_outxdrs));
@@ -767,7 +921,11 @@ clnt_dg_destroy(cl)
 	mem_free(cl, sizeof (CLIENT));
 	mutex_unlock(&clnt_fd_lock);
 	thr_sigsetmask(SIG_SETMASK, &mask, NULL);
+
+#ifndef FD_LOCK_LIST
 	cond_signal(&dg_cv[cu_fd]);
+#endif
+
 }
 
 static struct clnt_ops *
